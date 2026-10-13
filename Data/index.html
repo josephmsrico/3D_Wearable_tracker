@@ -1,0 +1,134 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FireTracker Command</title>
+<style>
+  body { margin:0; font-family:system-ui,sans-serif; background:#111; color:#eee; }
+  header { padding:10px 14px; background:#b22; font-weight:bold;
+           display:flex; justify-content:space-between; }
+  #status { font-weight:normal; }
+  main { padding:12px; display:grid; gap:12px; max-width:900px; margin:auto; }
+  canvas { width:100%; background:#1c1c1c; border-radius:8px; }
+  .card { background:#1c1c1c; border-radius:8px; padding:10px 12px; }
+  .card h2 { margin:0 0 8px; font-size:18px; display:flex; justify-content:space-between; }
+  .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:4px 12px; font-size:14px; }
+  .lbl { color:#999; margin-right:4px; }
+  .mode { font-size:12px; padding:2px 8px; border-radius:4px; background:#333; font-weight:normal; }
+  .alert { background:#c00; color:#fff; padding:6px; border-radius:6px; margin-bottom:6px;
+           font-weight:bold; text-align:center; animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:.45; } }
+  .lost { opacity:.5; }
+  .legend { font-size:12px; color:#999; }
+</style>
+</head>
+<body>
+<header><span>Tracker HUB</span><span id="status">Connecting…</span></header>
+<main>
+  <canvas id="map" width="600" height="420"></canvas>
+  <div class="legend">● solid = RSSI fix &nbsp; ○ hollow = dead reckoning (steps) &nbsp; - - circle = range only</div>
+  <div id="cards"></div>
+</main>
+<script>
+// Receiver positions in metres: keep in sync with RX_X / RX_Y in the Hub code
+const RX = [ {n:"Hub",x:0,y:0}, {n:"A1",x:10,y:0} ];
+const COLORS = ["#4af","#fa4","#4f8","#f4a","#ff4","#a4f","#4ff","#f84"];
+const LOST_MS = 5000;
+const trackers = {};
+x   
+const canvas = document.getElementById("map"), ctx = canvas.getContext("2d");
+const minX = Math.min(...RX.map(r=>r.x)) - 2, maxX = Math.max(...RX.map(r=>r.x)) + 2;
+const minY = Math.min(...RX.map(r=>r.y)) - 2, maxY = Math.max(...RX.map(r=>r.y)) + 2;
+const scale = Math.min(canvas.width/(maxX-minX), canvas.height/(maxY-minY));
+const px = (x,y) => [(x-minX)*scale, canvas.height-(y-minY)*scale];
+
+function draw() {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.strokeStyle = "#2a2a2a"; ctx.lineWidth = 1;               // 1 m grid
+  for (let x = Math.ceil(minX); x <= maxX; x++) { const [a] = px(x,0); ctx.beginPath(); ctx.moveTo(a,0); ctx.lineTo(a,canvas.height); ctx.stroke(); }
+  for (let y = Math.ceil(minY); y <= maxY; y++) { const [,b] = px(0,y); ctx.beginPath(); ctx.moveTo(0,b); ctx.lineTo(canvas.width,b); ctx.stroke(); }
+
+  ctx.font = "13px sans-serif";                                  // receivers
+  RX.forEach(r => { const [a,b] = px(r.x,r.y); ctx.fillStyle = "#888"; ctx.fillRect(a-6,b-6,12,12); ctx.fillText(r.n,a+9,b+4); });
+
+  const now = Date.now();
+  Object.values(trackers).forEach(t => {
+    const m = t.msg, c = COLORS[parseInt(m.id.slice(1)) % 8];
+    ctx.globalAlpha = (now - t.seen > LOST_MS) ? 0.35 : 1;
+    const [a,b] = px(m.x,m.y);
+    if (m.mode === "range") {
+      ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.setLineDash([6,4]);
+      ctx.beginPath(); ctx.arc(a,b,m.r*scale,0,2*Math.PI); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = c; ctx.fillText(m.id + " ~" + m.r.toFixed(1) + " m", a+9, b-12);
+    } else {
+      ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.beginPath();     // trail
+      t.trail.forEach((p,i) => { const [x,y] = px(p[0],p[1]); i ? ctx.lineTo(x,y) : ctx.moveTo(x,y); });
+      ctx.stroke();
+      ctx.beginPath(); ctx.arc(a,b,8,0,2*Math.PI);
+      if (m.mode === "fix") { ctx.fillStyle = c; ctx.fill(); } else { ctx.stroke(); }
+      ctx.fillStyle = c; ctx.fillText(m.id, a+11, b-8);
+    }
+    if (m.mandown || m.heat) {                                     // red alarm ring
+      ctx.strokeStyle = "#f00"; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(a,b,15,0,2*Math.PI); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+function nearestName(m) { const r = RX.find(r => r.x === m.x && r.y === m.y); return r ? r.n : "receiver"; }
+
+function renderCards() {
+  const now = Date.now();
+  const html = Object.values(trackers)
+    .sort((a,b) => a.msg.id.localeCompare(b.msg.id))
+    .map(t => {
+      const m = t.msg, age = Math.round((now - t.seen)/1000), lost = now - t.seen > LOST_MS;
+      const alerts = [];
+      if (m.mandown) alerts.push("MAN DOWN — no movement");
+      if (m.heat)    alerts.push("HEAT WARNING");
+      if (m.fault)   alerts.push("SENSOR FAULT");
+      if (lost)      alerts.push("SIGNAL LOST " + age + " s");
+      const modeTxt = { fix:"Position fix", dr:"Dead reckoning", range:"Range only" }[m.mode];
+      const pos = m.mode === "range"
+        ? "~" + m.r.toFixed(1) + " m from " + nearestName(m)
+        : m.x.toFixed(1) + ", " + m.y.toFixed(1) + " m";
+      return `<div class="card ${lost ? "lost" : ""}">
+        ${alerts.map(a => `<div class="alert">${a}</div>`).join("")}
+        <h2>${m.id} <span class="mode">${modeTxt}</span></h2>
+        <div class="grid">
+          <div><span class="lbl">Position</span>${pos}</div>
+          <div><span class="lbl">Receivers</span>${m.rx}${m.direct ? " (Hub direct)" : ""}</div>
+          <div><span class="lbl">Floor</span>${m.floor} (${m.alt.toFixed(1)} m)</div>
+          <div><span class="lbl">State</span>${m.moving ? "Moving" : "Still"}</div>
+          <div><span class="lbl">Temp</span>${m.temp.toFixed(1)} °C</div>
+          <div><span class="lbl">Pressure</span>${m.press.toFixed(1)} hPa</div>
+          <div><span class="lbl">Heading</span>${m.hdg}°</div>
+          <div><span class="lbl">Steps</span>${m.steps}</div>
+          <div><span class="lbl">Walked</span>E ${m.pdrX.toFixed(1)}, N ${m.pdrY.toFixed(1)} m</div>
+          <div><span class="lbl">Battery</span>${m.bat}%</div>
+          <div><span class="lbl">Updated</span>${age} s ago</div>
+        </div></div>`;
+    }).join("");
+  document.getElementById("cards").innerHTML = html || '<div class="card">Waiting for trackers…</div>';
+}
+
+function connect() {
+  const st = document.getElementById("status");
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen  = () => st.textContent = "Live";
+  ws.onclose = () => { st.textContent = "Reconnecting…"; setTimeout(connect, 2000); };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    const t = trackers[m.id] || (trackers[m.id] = { trail: [] });
+    t.msg = m; t.seen = Date.now();
+    if (m.mode !== "range") { t.trail.push([m.x, m.y]); if (t.trail.length > 60) t.trail.shift(); }
+  };
+}
+
+connect();
+setInterval(() => { draw(); renderCards(); }, 500);
+</script>
+</body>
+</html>

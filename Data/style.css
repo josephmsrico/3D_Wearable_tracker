@@ -1,0 +1,63 @@
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  font-family: -apple-system, Helvetica, sans-serif;
+  background: #1b1b1b;
+  color: #eee;
+}
+
+body { display: flex; flex-direction: column; }
+
+/* Top bar */
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 16px;
+  background: #b71c1c;
+}
+header h1 { font-size: 18px; margin: 0; }
+
+/* Connection badge */
+.conn { font-size: 13px; padding: 3px 10px; border-radius: 12px; font-weight: bold; }
+.conn.online  { background: #2e7d32; }
+.conn.offline { background: #555; }
+.conn.demo    { background: #f9a825; color: #000; }
+
+/* Map + side panel side by side */
+main { flex: 1; display: flex; min-height: 0; }
+#map { flex: 1; background: #2b2b2b; }
+
+#panel {
+  width: 280px;
+  overflow-y: auto;
+  padding: 12px;
+  background: #222;
+  border-left: 1px solid #333;
+}
+#panel h2 { font-size: 15px; margin: 0 0 10px; }
+
+/* One card per firefighter */
+.card {
+  background: #2d2d2d;
+  border-left: 4px solid #2e7d32;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+.card.alert { border-left-color: #e53935; background: #3a2020; }
+.card h3 { margin: 0 0 6px; font-size: 14px; }
+.row { display: flex; justify-content: space-between; padding: 1px 0; }
+.alerts { color: #ff8a80; font-weight: bold; margin-top: 4px; }
+.empty { color: #888; font-size: 13px; }
+
+.leaflet-tooltip { font-weight: bold; font-size: 12px; }
+
+/* Phones: stack panel under the map */
+@media (max-width: 700px) {
+  main { flex-direction: column; }
+  #panel { width: auto; height: 40%; border-left: none; border-top: 1px solid #333; }
+}
