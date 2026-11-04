@@ -16,7 +16,7 @@
 #ifndef ANCHOR_ID
 #define ANCHOR_ID 1          // set per board in platformio.ini
 #endif
-uint8_t HUB_MAC[6] = {0x68, 0xEE, 0x8F, 0xE3, 0x5F, 0xF1};   // Hub's AP MAC
+uint8_t HUB_MAC[6] = {0x68, 0xEE, 0x8F, 0xE3, 0x5F, 0xF1};   // Hub's AP MAC — must match the Hub's boot message
 
 Adafruit_NeoPixel pixel(NUM_PIXELS, RGB_PIN, NEO_RGB + NEO_KHZ800);
 
@@ -30,7 +30,16 @@ volatile bool everSeen = false;
 unsigned long lastStatusCheck = 0;
 unsigned long lastReport = 0;
 
-// Recognises Trackers by their magic byte (they no longer send a UUID)
+// Did the Hub actually receive our messages? (filled in by ESP-NOW)
+volatile uint32_t deliveredOk = 0, deliveredFail = 0;
+
+// ESP-NOW calls this after every send, telling us if the Hub acknowledged it
+void onSent(const uint8_t *mac, esp_now_send_status_t status) {
+  if (status == ESP_NOW_SEND_SUCCESS) deliveredOk++;
+  else                                deliveredFail++;
+}
+
+// Recognises Trackers by their magic byte
 class ScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice *dev) override {
     TrackerStatus s;
@@ -89,17 +98,25 @@ void setup() {
   }
 
   setLed(0, 0, 255);   // blue = booting
-  Serial.printf("\n=== ANCHOR %d === MAC %s\n", ANCHOR_ID, WiFi.macAddress().c_str());
 
   // ESP-NOW on the Hub's channel
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
+  esp_wifi_set_promiscuous(true);                              // makes the channel change stick
   esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  Serial.printf("\n=== ANCHOR %d === MAC %s\n", ANCHOR_ID, WiFi.macAddress().c_str());
+  Serial.printf("Sending to Hub %02X:%02X:%02X:%02X:%02X:%02X on channel %d\n",
+                HUB_MAC[0], HUB_MAC[1], HUB_MAC[2], HUB_MAC[3], HUB_MAC[4], HUB_MAC[5], WIFI_CHANNEL);
+
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed");
     setLed(255, 0, 255);   // purple = radio fault
     return;
   }
+  esp_now_register_send_cb(onSent);
+
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, HUB_MAC, 6);
   peer.channel = WIFI_CHANNEL;
@@ -151,16 +168,26 @@ void loop() {
       if (have) {
         esp_err_t err = esp_now_send(HUB_MAC, (uint8_t*)&r, sizeof(r));
         Serial.printf("T%d rssi %d (%d samples) -> %s\n",
-                      id, r.rssi, r.samples, err == ESP_OK ? "sent" : "send error");
+                      id, r.rssi, r.samples, err == ESP_OK ? "queued" : "send error");
       }
     }
   }
 
-  // ---- LED status check ----
+  // ---- Status check: Tracker heard? Hub receiving? ----
   if (millis() - lastStatusCheck >= STATUS_CHECK_INTERVAL_MS) {
     lastStatusCheck = millis();
-    bool connected = everSeen && (millis() - lastSeenMs < CONNECTION_TIMEOUT_MS);
-    setLed(connected ? 0 : 255, connected ? 255 : 0, 0);
-    Serial.printf("[%lu] Status check: %s\n", millis(), connected ? "CONNECTED" : "NOT CONNECTED");
+    bool trackerHeard = everSeen && (millis() - lastSeenMs < CONNECTION_TIMEOUT_MS);
+    uint32_t ok = deliveredOk, fail = deliveredFail;
+    deliveredOk = 0; deliveredFail = 0;
+    bool hubOk = ok > 0;
+
+    if (!trackerHeard) setLed(255, 0, 0);       // red    = can't hear the Tracker
+    else if (!hubOk)   setLed(255, 160, 0);     // orange = hears Tracker, but Hub isn't receiving
+    else               setLed(0, 255, 0);       // green  = all good
+
+    Serial.printf("[%lu] Tracker: %s | Hub delivery: %lu ok, %lu failed%s\n",
+                  millis(), trackerHeard ? "HEARD" : "NOT HEARD",
+                  (unsigned long)ok, (unsigned long)fail,
+                  (trackerHeard && !hubOk) ? "  <-- check HUB_MAC / channel" : "");
   }
 }
