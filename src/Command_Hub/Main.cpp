@@ -19,6 +19,7 @@ const char* AP_PASS = "firetrack123";
 #define MAX_TRACKERS 8
 float RX_X[MAX_RX] = { 0.0, 10.0,  0.0, 10.0 };   // Hub, A1, A2, A3
 float RX_Y[MAX_RX] = { 0.0,  0.0,  8.0,  8.0 };
+float RX_Z[MAX_RX] = { 1.0,  1.0,  1.0,  1.0 };   // mounting height above the ground floor (m)
 
 // Calibration defaults — also settable from the dashboard, `cal`, or `calhere`
 float TX_POWER_AT_1M = -59.0;
@@ -33,6 +34,14 @@ const unsigned long DR_MAX_MS = 30000;   // dead-reckon at most 30 s after the l
 const float MAX_PDR_JUMP_M = 5.0;        // ignore step jumps bigger than this (Tracker restarted)
 const float FLOOR_HEIGHT_M = 3.0;        // storey height (3 m so small baro drift doesn't flip the floor)
 
+// ---------- 3D settings ----------
+// The Tracker's barometer gives height RELATIVE to where it was switched on.
+// This is that starting height in the room frame (ground floor = 0 m), e.g. worn at chest height.
+float TRACKER_START_Z_M = 1.2;
+const float Z_MIN_M = -10.0;             // lowest believable height (basement)
+const float Z_MAX_M =  40.0;             // highest believable height (top floor)
+const float Z_GAIN  = 0.7;               // how quickly the shown height follows a new fix
+
 const unsigned long READING_MAX_AGE_MS = 3000;
 const unsigned long SOLVE_MS = 1000;
 
@@ -46,7 +55,7 @@ unsigned long lastDirectMs[MAX_TRACKERS];
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
 // ---------- Position state (only touched in loop) ----------
-float posX[MAX_TRACKERS], posY[MAX_TRACKERS];
+float posX[MAX_TRACKERS], posY[MAX_TRACKERS], posZ[MAX_TRACKERS];
 bool hasPos[MAX_TRACKERS];
 unsigned long lastFixMs[MAX_TRACKERS];
 int16_t lastSeq[MAX_TRACKERS];                 // -1 = nothing yet
@@ -63,13 +72,13 @@ char wsCmd[160];
 
 // ---------- Multi-node test logging ----------
 bool  logOn  = false;
-float truthX = NAN, truthY = NAN;   // where the Tracker really is (typed in during tests)
+float truthX = NAN, truthY = NAN, truthZ = NAN;   // where the Tracker really is (typed in during tests)
 
 // ---------- Self-calibration: stand at a known spot and type `calhere x y` ----------
 const unsigned long CAL_SETTLE_MS  = 3000;    // ignore readings from before you arrived
 const unsigned long CAL_COLLECT_MS = 10000;   // then listen for 10 s
 unsigned long calFrom = 0, calUntil = 0;      // calUntil = 0 means not collecting
-float calX = 0, calY = 0;
+float calX = 0, calY = 0, calZ = 0;
 double cSx = 0, cSy = 0, cSxx = 0, cSxy = 0, cSyy = 0;   // running sums for the straight-line fit
 long   cN = 0;
 
@@ -79,6 +88,8 @@ void loadConfig() {
   prefs.begin("hub", false);
   if (prefs.getBytesLength("rxx") == sizeof(RX_X)) prefs.getBytes("rxx", RX_X, sizeof(RX_X));
   if (prefs.getBytesLength("rxy") == sizeof(RX_Y)) prefs.getBytes("rxy", RX_Y, sizeof(RX_Y));
+  if (prefs.getBytesLength("rxz") == sizeof(RX_Z)) prefs.getBytes("rxz", RX_Z, sizeof(RX_Z));
+  TRACKER_START_Z_M = prefs.getFloat("tz0", TRACKER_START_Z_M);
   TX_POWER_AT_1M = prefs.getFloat("tx", TX_POWER_AT_1M);
   PATH_LOSS_EXP  = prefs.getFloat("n",  PATH_LOSS_EXP);
   prefs.end();
@@ -88,6 +99,8 @@ void saveConfig() {
   prefs.begin("hub", false);
   prefs.putBytes("rxx", RX_X, sizeof(RX_X));
   prefs.putBytes("rxy", RX_Y, sizeof(RX_Y));
+  prefs.putBytes("rxz", RX_Z, sizeof(RX_Z));
+  prefs.putFloat("tz0", TRACKER_START_Z_M);
   prefs.putFloat("tx", TX_POWER_AT_1M);
   prefs.putFloat("n",  PATH_LOSS_EXP);
   prefs.end();
@@ -95,11 +108,13 @@ void saveConfig() {
 
 // Tells the dashboard where the receivers are and the current calibration
 void sendConfig(AsyncWebSocketClient* client = nullptr) {
-  char buf[220];
+  char buf[320];
   snprintf(buf, sizeof(buf),
     "{\"type\":\"config\",\"rx\":[[%.2f,%.2f],[%.2f,%.2f],[%.2f,%.2f],[%.2f,%.2f]],"
+    "\"rz\":[%.2f,%.2f,%.2f,%.2f],\"tz0\":%.2f,"
     "\"tx\":%.1f,\"n\":%.2f}",
     RX_X[0], RX_Y[0], RX_X[1], RX_Y[1], RX_X[2], RX_Y[2], RX_X[3], RX_Y[3],
+    RX_Z[0], RX_Z[1], RX_Z[2], RX_Z[3], TRACKER_START_Z_M,
     TX_POWER_AT_1M, PATH_LOSS_EXP);
   if (client) client->text(buf);
   else        ws.textAll(buf);
@@ -183,7 +198,7 @@ void solveAndSend() {
     bool direct = lastDirect != 0 && now - lastDirect < READING_MAX_AGE_MS;
 
     // ---- Fresh receivers -> positions + distances ----
-    float xs[MAX_RX], ys[MAX_RX], ds[MAX_RX];
+    float xs[MAX_RX], ys[MAX_RX], zs[MAX_RX], ds[MAX_RX];
     float rxDist[MAX_RX];                            // each receiver's distance for the map (-1 = none)
     for (int i = 0; i < MAX_RX; i++) rxDist[i] = -1;
     int n = 0, nearest = -1;
@@ -195,12 +210,13 @@ void solveAndSend() {
 
       // Self-calibration: we know where you're standing, so we know the TRUE distance
       if (calUntil && now >= calFrom) {
-        float trueD = fmaxf(hypotf(calX - RX_X[rx], calY - RX_Y[rx]), 0.5f);
+        float dxc = calX - RX_X[rx], dyc = calY - RX_Y[rx], dzc = calZ - RX_Z[rx];
+        float trueD = fmaxf(sqrtf(dxc * dxc + dyc * dyc + dzc * dzc), 0.5f);
         double xv = 10.0 * log10(trueD), yv = r[rx].rssi;   // model: rssi = TX_1M - n * xv
         cSx += xv; cSy += yv; cSxx += xv * xv; cSxy += xv * yv; cSyy += yv * yv; cN++;
       }
 
-      xs[n] = RX_X[rx];  ys[n] = RX_Y[rx];  ds[n] = d;  n++;
+      xs[n] = RX_X[rx];  ys[n] = RX_Y[rx];  zs[n] = RX_Z[rx];  ds[n] = d;  n++;
       Serial.printf("T%d  rx%d  rssi %.0f  ~%.1f m\n", id, rx, r[rx].rssi, d);
       if (logOn) Serial.printf("RAW,%lu,%d,%d,%.1f,%.2f,%.2f,%.2f\n",
                                now, id, rx, r[rx].rssi, d, truthX, truthY);
@@ -227,10 +243,16 @@ void solveAndSend() {
       lastSeq[id] = s.seq;  lastPdrE[id] = e;  lastPdrN[id] = nn;
     }
 
-    // ---- 2. RSSI fix (2D trilateration) corrects the dead-reckoned position ----
+    // ---- Height from the barometer (room frame: ground floor = 0 m) ----
+    float alt  = s.altDm / 10.0f;                    // metres above where the Tracker booted
+    float baroZ = constrain(TRACKER_START_Z_M + alt, Z_MIN_M, Z_MAX_M);
+
+    // ---- 2. RSSI fix (3D trilateration) corrects the dead-reckoned position ----
     const char* mode;
-    float outX, outY, range = 0, fx = 0, fy = 0, rms = -1;
-    if (n >= 3 && trilaterate(xs, ys, ds, n, fx, fy, rms)) {
+    float outX, outY, outZ, range = 0, fx = 0, fy = 0, fz = baroZ, rms = -1;
+    if (n >= 3 && trilaterate3D(xs, ys, zs, ds, n, baroZ, true, fx, fy, fz, rms)) {
+      fz = constrain(fz, Z_MIN_M, Z_MAX_M);
+
       // Keep the fix inside the box around the receivers that heard it
       float bx0 = xs[0], bx1 = xs[0], by0 = ys[0], by1 = ys[0];
       for (int i = 1; i < n; i++) {
@@ -241,7 +263,7 @@ void solveAndSend() {
       fy = constrain(fy, by0 - FIX_MARGIN_M, by1 + FIX_MARGIN_M);
 
       // Right next to a receiver? Its reading is far more reliable than the distant ones,
-      // so pull the fix toward it: 0% at NEAR_SNAP_M, 100% at 0 m.
+      // so pull the fix toward it: 0% at NEAR_SNAP_M, 100% at 0 m. (x/y only: z stays on the barometer)
       if (nearestD < NEAR_SNAP_M) {
         float pull = 1.0f - nearestD / NEAR_SNAP_M;
         fx += pull * (RX_X[nearest] - fx);
@@ -249,41 +271,45 @@ void solveAndSend() {
       }
 
       float gain = FIX_GAIN / (1.0f + rms / 3.0f);   // trustworthy fix pulls harder
-      if (!hasPos[id]) { posX[id] = fx; posY[id] = fy; hasPos[id] = true; }
+      if (!hasPos[id]) { posX[id] = fx; posY[id] = fy; posZ[id] = fz; hasPos[id] = true; }
       else {
         posX[id] += gain * (fx - posX[id]);
         posY[id] += gain * (fy - posY[id]);
+        posZ[id] += Z_GAIN * (fz - posZ[id]);
       }
       lastFixMs[id] = now;
-      mode = "fix";  outX = posX[id];  outY = posY[id];
+      mode = "fix";  outX = posX[id];  outY = posY[id];  outZ = posZ[id];
     } else if (hasPos[id] && now - lastFixMs[id] < DR_MAX_MS) {
-      mode = "dr";   outX = posX[id];  outY = posY[id];  range = nearestD;
+      // Steps move x/y; the barometer still knows the height, so keep z live
+      posZ[id] += Z_GAIN * (baroZ - posZ[id]);
+      mode = "dr";   outX = posX[id];  outY = posY[id];  outZ = posZ[id];  range = nearestD;
     } else {
-      mode = "range"; outX = RX_X[nearest]; outY = RX_Y[nearest]; range = nearestD;
+      mode = "range"; outX = RX_X[nearest]; outY = RX_Y[nearest]; outZ = baroZ; range = nearestD;
     }
 
     // ---- Test log line ----
     if (logOn) {
       float err    = hypotf(outX - truthX, outY - truthY);                  // what the dashboard shows
       float rawErr = (rms >= 0) ? hypotf(fx - truthX, fy - truthY) : NAN;   // RSSI alone
-      Serial.printf("FIX,%lu,%d,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%.2f,%.2f,%.2f\n",
-                    now, id, mode, outX, outY, fx, fy, rms, n, truthX, truthY, err, rawErr);
+      // (z columns added at the END so existing log parsers keep working)
+      Serial.printf("FIX,%lu,%d,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+                    now, id, mode, outX, outY, fx, fy, rms, n, truthX, truthY, err, rawErr,
+                    outZ, fz, truthZ);
     }
 
     // ---- 3. Send everything to the dashboard ----
-    float alt = s.altDm / 10.0f;
-    char buf[600];
+    char buf[640];
     snprintf(buf, sizeof(buf),
-      "{\"id\":\"T%d\",\"mode\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"r\":%.2f,\"rms\":%.2f,"
-      "\"fx\":%.2f,\"fy\":%.2f,\"d\":[%.2f,%.2f,%.2f,%.2f],"
+      "{\"id\":\"T%d\",\"mode\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"r\":%.2f,\"rms\":%.2f,"
+      "\"fx\":%.2f,\"fy\":%.2f,\"fz\":%.2f,\"d\":[%.2f,%.2f,%.2f,%.2f],"
       "\"rx\":%d,\"direct\":%d,\"floor\":%d,\"alt\":%.1f,"
       "\"temp\":%.1f,\"press\":%.1f,\"hdg\":%u,\"steps\":%u,"
       "\"pdrX\":%.1f,\"pdrY\":%.1f,\"bat\":%u,"
       "\"moving\":%d,\"mandown\":%d,\"heat\":%d,\"fault\":%d,\"seq\":%u}",
-      id, mode, outX, outY, range, rms,
-      fx, fy, rxDist[0], rxDist[1], rxDist[2], rxDist[3],
+      id, mode, outX, outY, outZ, range, rms,
+      fx, fy, fz, rxDist[0], rxDist[1], rxDist[2], rxDist[3],
       n, direct ? 1 : 0,
-      (int)lroundf(alt / FLOOR_HEIGHT_M), alt,
+      (int)floorf(outZ / FLOOR_HEIGHT_M), alt,
       s.tempC10 / 10.0f, s.pressHpa10 / 10.0f, s.heading, s.steps,
       e, nn, s.battery,
       (s.flags & FLAG_MOVING)  ? 1 : 0, (s.flags & FLAG_MANDOWN) ? 1 : 0,
@@ -318,7 +344,8 @@ void startNodeBeacon(uint8_t type, uint8_t id) {
 
 void printSetup() {
   Serial.printf("CAL,%.1f,%.2f\n", TX_POWER_AT_1M, PATH_LOSS_EXP);
-  for (int i = 0; i < MAX_RX; i++) Serial.printf("RX,%d,%.2f,%.2f\n", i, RX_X[i], RX_Y[i]);
+  for (int i = 0; i < MAX_RX; i++) Serial.printf("RX,%d,%.2f,%.2f,%.2f\n", i, RX_X[i], RX_Y[i], RX_Z[i]);
+  Serial.printf("TZ0,%.2f\n", TRACKER_START_Z_M);
 }
 
 // Fit rssi = TX_1M - n * 10*log10(distance) through all collected samples (straight-line fit)
@@ -350,7 +377,7 @@ void finishCalibration() {
 
 // One command from the serial monitor OR the dashboard
 void handleCommand(const char* line) {
-  float a, b, v[10];
+  float a, b, c, v[10];
   int got = sscanf(line, "setup %f %f %f %f %f %f %f %f %f %f",
                    &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]);
   if (got == 10) {
@@ -368,16 +395,25 @@ void handleCommand(const char* line) {
     sendConfig();
     Serial.println("# setup saved from dashboard");
     printSetup();
-  } else if (sscanf(line, "truth %f %f", &a, &b) == 2) {
-    truthX = a; truthY = b; Serial.printf("# truth %.2f %.2f\n", a, b);
+  } else if (sscanf(line, "rxz %f %f %f %f", &v[0], &v[1], &v[2], &v[3]) == 4) {
+    // Receiver mounting heights: Hub, A1, A2, A3 (m above the ground floor)
+    for (int i = 0; i < MAX_RX; i++) RX_Z[i] = v[i];
+    resetPositions(); saveConfig(); sendConfig(); printSetup();
+  } else if (sscanf(line, "tz0 %f", &a) == 1) {
+    // Height the Tracker is at when it's switched on (m above the ground floor)
+    TRACKER_START_Z_M = a;
+    saveConfig(); sendConfig(); printSetup();
+  } else if ((got = sscanf(line, "truth %f %f %f", &a, &b, &c)) >= 2) {
+    truthX = a; truthY = b; truthZ = (got == 3) ? c : NAN;
+    Serial.printf("# truth %.2f %.2f %.2f\n", a, b, truthZ);
   } else if (!strcmp(line, "truth off")) {
-    truthX = truthY = NAN; Serial.println("# truth off");
-  } else if (sscanf(line, "calhere %f %f", &a, &b) == 2) {
-    calX = a; calY = b;
+    truthX = truthY = truthZ = NAN; Serial.println("# truth off");
+  } else if ((got = sscanf(line, "calhere %f %f %f", &a, &b, &c)) >= 2) {
+    calX = a; calY = b; calZ = (got == 3) ? c : TRACKER_START_Z_M;
     calFrom  = millis() + CAL_SETTLE_MS;
     calUntil = calFrom + CAL_COLLECT_MS;
-    Serial.printf("# calibrating at (%.1f, %.1f): stand still for %lu s...\n",
-                  a, b, (CAL_SETTLE_MS + CAL_COLLECT_MS) / 1000);
+    Serial.printf("# calibrating at (%.1f, %.1f, %.1f): stand still for %lu s...\n",
+                  calX, calY, calZ, (CAL_SETTLE_MS + CAL_COLLECT_MS) / 1000);
   } else if (!strcmp(line, "calreset")) {
     cSx = cSy = cSxx = cSxy = cSyy = 0; cN = 0;
     Serial.println("# calibration samples cleared");
@@ -389,7 +425,8 @@ void handleCommand(const char* line) {
   } else if (!strcmp(line, "log off")) {
     logOn = false;
   } else {
-    Serial.println("# commands: calhere <x> <y> | calreset | cal <tx> <n> | log on | log off | truth <x> <y> | truth off");
+    Serial.println("# commands: calhere <x> <y> [z] | calreset | cal <tx> <n> | rxz <z0> <z1> <z2> <z3> | tz0 <z>"
+                   " | log on | log off | truth <x> <y> [z] | truth off");
   }
 }
 

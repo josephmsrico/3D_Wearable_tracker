@@ -38,6 +38,7 @@
                   font-size:15px; cursor:pointer; }
   .setup button:disabled { opacity:.5; cursor:default; }
   #saveMsg { margin-left:10px; font-size:14px; }
+  .viewtitle { font-size:13px; color:#999; margin:-4px 0 -6px; }
 </style>
 </head>
 <body>
@@ -45,21 +46,26 @@
 <main>
   <canvas id="map" width="600" height="480"></canvas>
   <div class="legend">● fused position (smoothed) &nbsp; ✕ raw trilateration &nbsp; thin circles = each receiver's RSSI distance &nbsp; ○ hollow = dead reckoning &nbsp; - - = range only</div>
+  <div class="viewtitle">Side view: left–right = x across the room, up–down = height. ■ receivers at their mounting height.</div>
+  <canvas id="side" width="600" height="220"></canvas>
   <label class="legend"><input type="checkbox" id="circles" checked> Show RSSI distance circles</label>
   <div id="cards"></div>
 
   <details class="card setup" id="setup">
     <summary>Setup: receiver positions &amp; calibration</summary>
-    <p class="legend">Positions in metres, measured from the Hub. x = towards A1, y = towards A2.
-      Saved on the Hub, so they survive reboots.</p>
+    <p class="legend">Positions in metres, measured from the Hub. x = towards A1, y = towards A2,
+      z = mounting height above the ground floor. Saved on the Hub, so they survive reboots.</p>
     <table class="setup-table">
-      <thead><tr><th>Receiver</th><th>x (m)</th><th>y (m)</th></tr></thead>
+      <thead><tr><th>Receiver</th><th>x (m)</th><th>y (m)</th><th>z height (m)</th></tr></thead>
       <tbody id="rxRows"></tbody>
     </table>
     <div class="row">
       <label>TX at 1 m (dBm) <input id="tx" type="number" step="0.5"></label>
       <label>Path loss n <input id="n" type="number" step="0.05"></label>
+      <label>Tracker start height (m) <input id="tz0" type="number" step="0.1"></label>
     </div>
+    <p class="legend">Tracker start height = how high the Tracker is when it's switched on (e.g. 1.2 m at chest height).
+      Its barometer measures height from there.</p>
     <button id="save" disabled>Save to Hub</button><span id="saveMsg"></span>
   </details>
 </main>
@@ -67,7 +73,11 @@
 // Receiver positions in metres: index 0 = Hub, 1 = A1, 2 = A2, 3 = A3.
 // These are just placeholders until the Hub sends its saved setup (on connect).
 const NAMES = ["Hub", "A1", "A2", "A3"];
-let RX = [ {n:"Hub",x:0,y:0}, {n:"A1",x:10,y:0}, {n:"A2",x:0,y:8}, {n:"A3",x:10,y:8} ];
+let RX = [ {n:"Hub",x:0,y:0,z:1}, {n:"A1",x:10,y:0,z:1}, {n:"A2",x:0,y:8,z:1}, {n:"A3",x:10,y:8,z:1} ];
+const FLOOR_H = 3.0;   // must match FLOOR_HEIGHT_M on the Hub
+function floorName(f) { return f === 0 ? "Ground" : f > 0 ? "Level " + f : "B" + (-f); }
+// Height of a tracker, falling back to the old altitude if the Hub firmware is pre-3D
+function heightOf(m) { return typeof m.z === "number" ? m.z : (m.alt || 0); }
 const rxSeen = [true, true, true, false];   // A3 only appears once it has heard a tracker
 const COLORS = ["#4af","#fa4","#4f8","#f4a","#ff4","#a4f","#4ff","#f84"];
 const LOST_MS = 5000;
@@ -113,13 +123,18 @@ function draw() {
     ctx.globalAlpha = alpha;
     const [a,b] = px(m.x,m.y);
 
-    // Each receiver's RSSI distance: where these cross is the trilateration
+    // Each receiver's RSSI distance: where these cross is the trilateration.
+    // RSSI measures the slant distance through the air; on a floor plan we draw the
+    // flat part of it (Pythagoras with the height gap), the same as the 3D solver does.
     if (showCircles && Array.isArray(m.d)) {
       ctx.strokeStyle = c; ctx.lineWidth = 1; ctx.globalAlpha = alpha * 0.4;
+      const tz = heightOf(m);
       m.d.forEach((d, i) => {
         if (!(d > 0) || !RX[i]) return;
+        const gap = typeof m.z === "number" ? tz - RX[i].z : 0;
+        const flat = Math.sqrt(Math.max(d * d - gap * gap, 0.09));
         const [rx, ry] = px(RX[i].x, RX[i].y);
-        ctx.beginPath(); ctx.arc(rx, ry, d*scale, 0, 2*Math.PI); ctx.stroke();
+        ctx.beginPath(); ctx.arc(rx, ry, flat*scale, 0, 2*Math.PI); ctx.stroke();
       });
       ctx.globalAlpha = alpha;
     }
@@ -143,13 +158,72 @@ function draw() {
 
       ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(a,b,8,0,2*Math.PI);
       if (m.mode === "fix") { ctx.fillStyle = c; ctx.fill(); } else { ctx.stroke(); }
-      ctx.fillStyle = c; ctx.fillText(m.id, a+11, b-8);
+      ctx.fillStyle = c; ctx.fillText(m.id + "  " + floorName(m.floor) + " · " + heightOf(m).toFixed(1) + " m", a+11, b-8);
     }
     if (m.mandown || m.heat) {                                     // red alarm ring
       ctx.strokeStyle = "#f00"; ctx.lineWidth = 3;
       ctx.beginPath(); ctx.arc(a,b,15,0,2*Math.PI); ctx.stroke();
     }
     ctx.globalAlpha = 1;
+  });
+}
+
+// ================= Side view (x vs height) =================
+const side = document.getElementById("side"), sctx = side.getContext("2d");
+
+function drawSide() {
+  const W = side.width, H = side.height;
+  sctx.clearRect(0, 0, W, H);
+  const rs = shownRX();
+  const list = Object.values(trackers);
+  const zs = rs.map(r => r.z).concat(list.map(t => heightOf(t.msg)));
+  const zMin = Math.min(0, ...zs) - 0.5;
+  const zMax = Math.max(FLOOR_H * 2, ...zs) + 0.8;
+  const left = 62;                                    // room for floor labels
+  const sx = x => left + (x - minX) / (maxX - minX) * (W - left - 10);
+  const sz = z => H - 12 - (z - zMin) / (zMax - zMin) * (H - 24);
+
+  // Floors
+  sctx.font = "12px sans-serif";
+  for (let f = Math.floor(zMin / FLOOR_H); f * FLOOR_H <= zMax; f++) {
+    const y = sz(f * FLOOR_H);
+    sctx.strokeStyle = f === 0 ? "#666" : "#333"; sctx.lineWidth = f === 0 ? 2 : 1;
+    sctx.beginPath(); sctx.moveTo(left, y); sctx.lineTo(W - 10, y); sctx.stroke();
+    sctx.fillStyle = "#888"; sctx.fillText(floorName(f), 6, y + 4);
+  }
+
+  // Receivers: two can land on the same spot side-on, so join their names
+  const spots = {};
+  rs.forEach(r => {
+    const a = sx(r.x), b = sz(r.z), k = Math.round(a / 8) + "," + Math.round(b / 8);
+    (spots[k] = spots[k] || { a, b, names: [] }).names.push(r.n);
+  });
+  Object.values(spots).forEach(s => {
+    sctx.fillStyle = "#888"; sctx.fillRect(s.a - 5, s.b - 5, 10, 10);
+    sctx.fillText(s.names.join(" / ") + "", s.a + 8, s.b + 4);
+  });
+
+  // Trackers
+  const now = Date.now();
+  list.forEach(t => {
+    const m = t.msg, c = COLORS[parseInt(m.id.slice(1)) % 8];
+    if (m.mode === "range") return;                   // no real x position to draw
+    sctx.globalAlpha = (now - t.seen > LOST_MS) ? 0.35 : 1;
+    const a = sx(m.x), b = sz(heightOf(m));
+    if (m.mode === "fix" && typeof m.fx === "number" && typeof m.fz === "number") {
+      sctx.strokeStyle = c; sctx.lineWidth = 2;       // raw fix
+      const fa = sx(m.fx), fb = sz(m.fz);
+      sctx.beginPath(); sctx.moveTo(fa-5,fb-5); sctx.lineTo(fa+5,fb+5); sctx.moveTo(fa+5,fb-5); sctx.lineTo(fa-5,fb+5); sctx.stroke();
+    }
+    sctx.lineWidth = 2; sctx.strokeStyle = c; sctx.fillStyle = c;
+    sctx.beginPath(); sctx.arc(a, b, 7, 0, 2 * Math.PI);
+    if (m.mode === "fix") sctx.fill(); else sctx.stroke();
+    sctx.fillText(m.id + "  " + heightOf(m).toFixed(1) + " m", a + 10, b - 8);
+    if (m.mandown || m.heat) {
+      sctx.strokeStyle = "#f00"; sctx.lineWidth = 3;
+      sctx.beginPath(); sctx.arc(a, b, 13, 0, 2 * Math.PI); sctx.stroke();
+    }
+    sctx.globalAlpha = 1;
   });
 }
 
@@ -190,7 +264,9 @@ function renderCards() {
           <div><span class="lbl">Position</span>${pos}</div>
           <div><span class="lbl">Accuracy</span>${acc}</div>
           <div style="grid-column:1 / -1"><span class="lbl">Receivers</span>${rxStatus(m)}</div>
-          <div><span class="lbl">Floor</span>${m.floor} (${m.alt.toFixed(1)} m)</div>
+          <div><span class="lbl">Floor</span>${floorName(m.floor)}</div>
+          <div><span class="lbl">Height</span>${heightOf(m).toFixed(1)} m${m.mode === "fix" && typeof m.fz === "number" ? ` <span class="lbl">(raw ${m.fz.toFixed(1)})</span>` : ""}</div>
+          <div><span class="lbl">Baro change</span>${m.alt >= 0 ? "+" : ""}${m.alt.toFixed(1)} m since boot</div>
           <div><span class="lbl">State</span>${m.moving ? "Moving" : "Still"}</div>
           <div><span class="lbl">Temp</span>${m.temp.toFixed(1)} °C</div>
           <div><span class="lbl">Pressure</span>${m.press.toFixed(1)} hPa</div>
@@ -206,18 +282,21 @@ function renderCards() {
 
 // ================= Setup panel =================
 
-// Build one row of x / y boxes per receiver
+// Build one row of x / y / z boxes per receiver
 document.getElementById("rxRows").innerHTML = NAMES.map((name, i) => `
   <tr><td>${name}${i === 3 ? ' <span class="legend">(if fitted)</span>' : ""}</td>
       <td><input id="rx${i}x" type="number" step="0.1"></td>
-      <td><input id="rx${i}y" type="number" step="0.1"></td></tr>`).join("");
+      <td><input id="rx${i}y" type="number" step="0.1"></td>
+      <td><input id="rx${i}z" type="number" step="0.1"></td></tr>`).join("");
 
 // Put the Hub's saved values into the boxes
 function fillSetupForm(cfg) {
   cfg.rx.forEach((p, i) => {
     document.getElementById(`rx${i}x`).value = p[0];
     document.getElementById(`rx${i}y`).value = p[1];
+    if (Array.isArray(cfg.rz)) document.getElementById(`rx${i}z`).value = cfg.rz[i];
   });
+  if (typeof cfg.tz0 === "number") document.getElementById("tz0").value = cfg.tz0;
   document.getElementById("tx").value = cfg.tx;
   document.getElementById("n").value  = cfg.n;
 }
@@ -232,13 +311,20 @@ function saveSetup() {
   const tx = parseFloat(document.getElementById("tx").value);
   const n  = parseFloat(document.getElementById("n").value);
   vals.push(tx, n);
+  const zs = [0, 1, 2, 3].map(i => parseFloat(document.getElementById(`rx${i}z`).value));
+  const tz0 = parseFloat(document.getElementById("tz0").value);
 
-  if (vals.some(v => !Number.isFinite(v))) { msg.textContent = "Fill in every box with a number"; return; }
+  if (vals.some(v => !Number.isFinite(v)) || zs.some(v => !Number.isFinite(v)) || !Number.isFinite(tz0)) {
+    msg.textContent = "Fill in every box with a number"; return;
+  }
   if (tx < -100 || tx > -20) { msg.textContent = "TX at 1 m should be between -100 and -20"; return; }
   if (n < 1 || n > 6)        { msg.textContent = "Path loss n should be between 1 and 6"; return; }
   if (!ws || ws.readyState !== WebSocket.OPEN) { msg.textContent = "Not connected to the Hub"; return; }
 
+  // The Hub takes one command at a time, so send the three pieces a moment apart
   ws.send("setup " + vals.join(" "));
+  setTimeout(() => ws.send("rxz " + zs.join(" ")), 400);
+  setTimeout(() => ws.send("tz0 " + tz0), 800);
   waitingForSave = true;
   msg.textContent = "Saving…";
 }
@@ -246,7 +332,8 @@ document.getElementById("save").onclick = saveSetup;
 
 // The Hub sent its setup (on connect, or after a save)
 function applyConfig(cfg) {
-  RX = cfg.rx.map((p, i) => ({ n: NAMES[i], x: p[0], y: p[1] }));
+  RX = cfg.rx.map((p, i) => ({ n: NAMES[i], x: p[0], y: p[1],
+                                z: Array.isArray(cfg.rz) ? cfg.rz[i] : (RX[i] ? RX[i].z : 1) }));
   Object.values(trackers).forEach(t => t.trail = []);   // old trails are in the old layout
   recomputeView();
   fillSetupForm(cfg);
@@ -285,7 +372,6 @@ function connect() {
 }
 
 connect();
-setInterval(() => { draw(); renderCards(); }, 500);
+setInterval(() => { draw(); drawSide(); renderCards(); }, 500);
 </script>
 </body>
-</html>
